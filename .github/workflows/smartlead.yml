@@ -24,13 +24,5 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run SmartLead Cleanup Script
-        env:
-          SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_SERVER_URL: ${{ github.server_url }}
         run: |
           python smartlead_consolidated_git.py
