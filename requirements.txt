@@ -1,10 +1,5 @@
-aiohttp==3.9.1
-pandas==2.0.3
-pytz==2023.3
-asyncio-throttle==1.0.2
-python-dotenv==1.0.0
-
-requests>=2.31.0
-pandas>=2.0.0
-pytz>=2023.3
-python-dotenv>=1.0.0
+requests
+pandas==2.2.2
+numpy==1.26.4
+python-dotenv
+pytz
