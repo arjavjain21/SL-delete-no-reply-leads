@@ -30,7 +30,7 @@ BASE_URL = "https://server.smartlead.ai/api/v1"
 # Runtime settings from environment or defaults
 TARGET_LEADS = 10000
 DAYS_WITHOUT_ACTIVITY = 45
-EXCLUDE_CLIENT_IDS = 1598
+EXCLUDE_CLIENT_IDS = [1598]
 
 # Email configuration from environment
 SENDER_EMAIL = 'arjavjain777@gmail.com'
