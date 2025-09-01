@@ -28,8 +28,8 @@ API_KEY = '2fbf4f7d-44af-4ff1-8e25-5655f5483fd0_94zyakr'
 BASE_URL = "https://server.smartlead.ai/api/v1"
 
 # Runtime settings from environment or defaults
-TARGET_LEADS = 10000
-DAYS_WITHOUT_ACTIVITY = 45
+TARGET_LEADS = 20000
+DAYS_WITHOUT_ACTIVITY = 30
 EXCLUDE_CLIENT_IDS = [1598]
 
 # Email configuration from environment
