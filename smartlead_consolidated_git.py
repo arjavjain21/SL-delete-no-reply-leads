@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 SmartLead Lead Deletion Script - GitHub Actions Version
-Combines all functionality: fetch campaigns, export leads, backup, and delete
-Modified to work with .env files and environment variables
+Modified to use GitHub Secrets for sensitive information
 """
 
 import requests
@@ -17,25 +16,20 @@ import pandas as pd
 from requests.exceptions import HTTPError, ConnectionError, Timeout, RequestException
 import pytz
 from email.message import EmailMessage
-from dotenv import load_dotenv
 
-# === LOAD ENVIRONMENT VARIABLES ===
-# Load from .env file first, then environment variables take precedence
-load_dotenv()
-
-# === CONFIGURATION FROM ENVIRONMENT VARIABLES ===
-API_KEY = '2fbf4f7d-44af-4ff1-8e25-5655f5483fd0_94zyakr'
+# === CONFIGURATION FROM ENVIRONMENT VARIABLES (GitHub Secrets) ===
+API_KEY = os.environ.get('SMARTLEAD_API_KEY')
 BASE_URL = "https://server.smartlead.ai/api/v1"
 
 # Runtime settings from environment or defaults
-TARGET_LEADS = 20000
-DAYS_WITHOUT_ACTIVITY = 30
-EXCLUDE_CLIENT_IDS = [1598]
+TARGET_LEADS = int(os.environ.get('TARGET_LEADS', '20000'))
+DAYS_WITHOUT_ACTIVITY = int(os.environ.get('DAYS_WITHOUT_ACTIVITY', '30'))
+EXCLUDE_CLIENT_IDS = [int(x.strip()) for x in os.environ.get('EXCLUDE_CLIENT_IDS', '1598').split(',') if x.strip()]
 
-# Email configuration from environment
-SENDER_EMAIL = 'arjavjain777@gmail.com'
-APP_PASSWORD = 'whregjzxhpkbnata'
-RECIPIENT_EMAILS = 'arjav@eagleinfoservice.com'
+# Email configuration from environment (GitHub Secrets)
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
+APP_PASSWORD = os.environ.get('EMAIL_APP_PASSWORD')
+RECIPIENT_EMAILS = [email.strip() for email in os.environ.get('RECIPIENT_EMAILS', '').split(',') if email.strip()]
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
 
@@ -52,9 +46,9 @@ def validate_environment():
     """Validate that all required environment variables are set"""
     required_vars = {
         'SMARTLEAD_API_KEY': API_KEY,
-        'EMAIL_SENDER': SENDER_EMAIL,
-        'EMAIL_PASSWORD': APP_PASSWORD,
-        'EMAIL_RECIPIENTS': RECIPIENT_EMAILS[0] if RECIPIENT_EMAILS else None
+        'SENDER_EMAIL': SENDER_EMAIL,
+        'EMAIL_APP_PASSWORD': APP_PASSWORD,
+        'RECIPIENT_EMAILS': RECIPIENT_EMAILS[0] if RECIPIENT_EMAILS else None
     }
     
     missing_vars = [var for var, value in required_vars.items() if not value]
@@ -62,11 +56,11 @@ def validate_environment():
     if missing_vars:
         raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
     
-    print(f"✅ Configuration loaded from .env file and environment variables")
+    print(f"✅ Configuration loaded from environment variables")
     print(f"✅ Target leads: {TARGET_LEADS:,}")
     print(f"✅ Days filter: {DAYS_WITHOUT_ACTIVITY}")
     print(f"✅ Excluded client IDs: {EXCLUDE_CLIENT_IDS}")
-    print(f"✅ Recipients: {len([r for r in RECIPIENT_EMAILS if r.strip()])}")
+    print(f"✅ Recipients: {len(RECIPIENT_EMAILS)}")
 
 # === LOGGING SETUP ===
 def setup_logging():
@@ -113,7 +107,7 @@ def send_email(subject, body, attachments=[], logger=None):
     try:
         msg = EmailMessage()
         msg["From"] = SENDER_EMAIL
-        msg["To"] = ", ".join([r.strip() for r in RECIPIENT_EMAILS if r.strip()])
+        msg["To"] = ", ".join(RECIPIENT_EMAILS)
         msg["Subject"] = subject
         msg.set_content(body)
 
