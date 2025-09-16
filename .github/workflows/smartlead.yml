@@ -29,8 +29,8 @@ jobs:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
-          TARGET_LEADS: ${{ secrets.TARGET_LEADS }}
-          DAYS_WITHOUT_ACTIVITY: ${{ secrets.DAYS_WITHOUT_ACTIVITY }}
-          EXCLUDE_CLIENT_IDS: ${{ secrets.EXCLUDE_CLIENT_IDS }}
+          TARGET_LEADS: ${{ vars.TARGET_LEADS }}
+          DAYS_WITHOUT_ACTIVITY: ${{ vars.DAYS_WITHOUT_ACTIVITY }}
+          EXCLUDE_CLIENT_IDS: ${{ vars.EXCLUDE_CLIENT_IDS }}
         run: |
           python smartlead_consolidated_git.py
