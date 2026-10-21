@@ -33,13 +33,17 @@ def local_request_only(session, method, url, *args, **kwargs):
 
 
 def setUpModule():
-    global _network_guard
+    global _network_guard, _github_context
+    # Fixture progress should not create fake notices on the real run page.
+    _github_context = patch.dict(os.environ, {'GITHUB_ACTIONS': 'false'})
+    _github_context.start()
     _network_guard = patch.object(requests.sessions.Session, 'request', new=local_request_only)
     _network_guard.start()
 
 
 def tearDownModule():
     _network_guard.stop()
+    _github_context.stop()
 
 
 def response(status=200, body=None, headers=None):
