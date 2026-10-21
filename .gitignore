@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+run-output/
+exports/
+*.log
+all_campaigns_analysis_*.csv
+leads_deletion_backup_*.csv
+run-state.json
