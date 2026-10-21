@@ -16,7 +16,7 @@ import hashlib
 import math
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import pandas as pd
@@ -33,6 +33,7 @@ DAYS_WITHOUT_ACTIVITY = int(os.environ.get('DAYS_WITHOUT_ACTIVITY') or '30')
 EXCLUDE_CLIENT_IDS = [int(x.strip()) for x in (os.environ.get('EXCLUDE_CLIENT_IDS') or '1598').split(',') if x.strip()]
 SMARTLEAD_REQUESTS_PER_MINUTE = int(os.environ.get('SMARTLEAD_REQUESTS_PER_MINUTE') or '5400')
 DELETE_WORKERS = int(os.environ.get('DELETE_WORKERS') or '10')
+ANALYSIS_WORKERS = int(os.environ.get('ANALYSIS_WORKERS') or '16')
 
 # Email configuration from environment (GitHub Secrets)
 SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
@@ -71,6 +72,8 @@ def validate_environment(require_smartlead=True):
         raise ValueError('SMARTLEAD_REQUESTS_PER_MINUTE must be between 1 and 6000')
     if not 1 <= DELETE_WORKERS <= 32:
         raise ValueError('DELETE_WORKERS must be between 1 and 32')
+    if not 1 <= ANALYSIS_WORKERS <= 32:
+        raise ValueError('ANALYSIS_WORKERS must be between 1 and 32')
     
     print(f"✅ Configuration loaded from environment variables")
     print(f"✅ Target leads: {TARGET_LEADS:,}")
@@ -296,6 +299,7 @@ class SmartLeadProcessor:
         self.execution_stats = {
             'campaigns_fetched': 0,
             'campaigns_filtered': 0,
+            'campaigns_analyzed': 0,
             'campaigns_selected': 0,
             'total_leads_exported': 0,
             'no_reply_leads_found': 0,
@@ -305,87 +309,98 @@ class SmartLeadProcessor:
             'execution_time': 0
         }
         self.output_files = []
+        self.sample_campaigns = 0
 
-    def filter_and_analyze_campaigns(self, campaigns):
-        """Filter campaigns and create comprehensive analysis"""
-        self.logger.info(f"Filtering {len(campaigns)} campaigns...")
-        
-        # Setup timezone and cutoff date
-        ist_tz = pytz.timezone("Asia/Kolkata")
-        cutoff_date = datetime.now(ist_tz) - timedelta(days=DAYS_WITHOUT_ACTIVITY)
-        
-        # Output CSV for all campaigns
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        campaigns_csv = f"all_campaigns_analysis_{timestamp}.csv"
+    def filter_and_analyze_campaigns(self, campaigns, sample_campaigns=0):
+        """Parse eligibility once, then export concurrently with bounded memory."""
+        self.logger.info('Filtering %s campaigns...', len(campaigns))
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        now = datetime.now(ist_tz)
+        cutoff_date = now - timedelta(days=DAYS_WITHOUT_ACTIVITY)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        campaigns_csv = f'all_campaigns_analysis_{timestamp}.csv'
         self.output_files.append(campaigns_csv)
-        
-        filtered_campaigns = []
-        
-        with open(campaigns_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Campaign ID", "Campaign Name", "Status", "Client ID",
-                "Created At (UTC)", "Created At (IST)", 
-                "Updated At (UTC)", "Updated At (IST)",
-                "Days Since Creation", "Included in Filter",
-                "Total Leads", "No Reply Leads", "Reply Rate %"
-            ])
-            
-            for campaign in campaigns:
-                try:
-                    campaign_id = campaign.get("id")
-                    campaign_name = campaign.get("name", "")
-                    status = campaign.get("status", "")
-                    client_id = campaign.get("client_id")
-                    if client_id is not None:
-                        client_id = int(client_id)
-                    
-                    # Parse timestamps
-                    created_utc = datetime.fromisoformat(campaign["created_at"].replace('Z', '+00:00'))
-                    updated_utc = datetime.fromisoformat(campaign["updated_at"].replace('Z', '+00:00'))
-                    if created_utc.tzinfo is None or updated_utc.tzinfo is None:
-                        raise ValueError('Campaign timestamps must include a timezone')
-                    created_ist = created_utc.astimezone(ist_tz)
-                    updated_ist = updated_utc.astimezone(ist_tz)
-                    
-                    days_since_creation = (datetime.now(ist_tz) - created_ist).days
-                    
-                    # Determine if campaign should be included
-                    include_campaign = (
-                        client_id not in EXCLUDE_CLIENT_IDS and
-                        status in ("PAUSED", "COMPLETED") and
-                        created_ist <= cutoff_date
-                    )
-                    
-                    total_leads = 0
-                    no_reply_leads = 0
-                    reply_rate = 0
-                    
-                    if include_campaign:
-                        filtered_campaigns.append(campaign)
-                        # Export and analyze leads for included campaigns
-                        leads_file = export_leads_csv(self.api_key, campaign_id, self.logger)
-                        if leads_file:
-                            _, total_leads, no_reply_leads = analyze_campaign_leads(leads_file, self.logger)
-                            reply_rate = ((total_leads - no_reply_leads) / total_leads * 100) if total_leads > 0 else 0
-                    
-                    writer.writerow([
-                        campaign_id, campaign_name, status, client_id,
-                        created_utc, created_ist, updated_utc, updated_ist,
-                        days_since_creation, "Yes" if include_campaign else "No",
-                        total_leads, no_reply_leads, f"{reply_rate:.1f}%"
-                    ])
-                    
-                except Exception as e:
-                    raise RuntimeError(f"Cannot safely prepare campaign {campaign.get('id')}: {e}") from e
-        
+        rows = []
+        eligible_indices = []
+        seen_ids = set()
+        for campaign in campaigns:
+            try:
+                campaign_id = int(campaign['id'])
+                if campaign_id in seen_ids:
+                    raise ValueError('Duplicate campaign ID')
+                seen_ids.add(campaign_id)
+                client_id = campaign.get('client_id')
+                if client_id is not None:
+                    client_id = int(client_id)
+                created_utc = datetime.fromisoformat(campaign['created_at'].replace('Z', '+00:00'))
+                updated_utc = datetime.fromisoformat(campaign['updated_at'].replace('Z', '+00:00'))
+                if created_utc.tzinfo is None or updated_utc.tzinfo is None:
+                    raise ValueError('Campaign timestamps must include a timezone')
+                created_ist = created_utc.astimezone(ist_tz)
+                updated_ist = updated_utc.astimezone(ist_tz)
+                eligible = (client_id not in EXCLUDE_CLIENT_IDS
+                            and campaign.get('status') in ('PAUSED', 'COMPLETED')
+                            and created_ist <= cutoff_date)
+                if eligible:
+                    eligible_indices.append(len(rows))
+                rows.append([campaign_id, campaign.get('name', ''), campaign.get('status', ''),
+                             client_id, created_utc, created_ist, updated_utc, updated_ist,
+                             (now - created_ist).days, 'No', 0, 0, '0.0%'])
+            except Exception as exc:
+                raise RuntimeError(f"Cannot safely prepare campaign {campaign.get('id')}: {exc}") from exc
+
         self.execution_stats['campaigns_fetched'] = len(campaigns)
-        self.execution_stats['campaigns_filtered'] = len(filtered_campaigns)
-        
-        self.logger.info(f"Created comprehensive campaigns analysis: {campaigns_csv}")
-        self.logger.info(f"Filtered to {len(filtered_campaigns)} eligible campaigns")
-        
-        return filtered_campaigns
+        self.execution_stats['campaigns_filtered'] = len(eligible_indices)
+        sampled = eligible_indices[:sample_campaigns] if sample_campaigns else eligible_indices
+        sampled_set = set(sampled)
+        for index in eligible_indices:
+            rows[index][9] = 'Yes' if index in sampled_set else 'Not sampled'
+        self.logger.info('Preparing %s of %s eligible campaigns using %s workers',
+                         len(sampled), len(eligible_indices), ANALYSIS_WORKERS)
+        if os.environ.get('GITHUB_ACTIONS') == 'true':
+            print(f'::notice::Preparing {len(sampled)} of {len(eligible_indices)} eligible campaigns; {len(campaigns)} total campaigns', flush=True)
+
+        def analyze(index):
+            campaign_id = rows[index][0]
+            try:
+                path = export_leads_csv(self.api_key, campaign_id, self.logger)
+                if not path:
+                    raise RuntimeError('Missing CSV export')
+                _, total, no_reply = analyze_campaign_leads(path, self.logger)
+                return total, no_reply
+            except Exception as exc:
+                raise RuntimeError(f'Cannot safely prepare campaign {campaign_id}: {exc}') from exc
+
+        indices = iter(sampled)
+        with ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as executor:
+            pending = {}
+            for _ in range(min(ANALYSIS_WORKERS, len(sampled))):
+                index = next(indices)
+                pending[executor.submit(analyze, index)] = index
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index = pending.pop(future)
+                    total, no_reply = future.result()
+                    rate = (total - no_reply) / total * 100 if total else 0
+                    rows[index][10:] = [total, no_reply, f'{rate:.1f}%']
+                    self.execution_stats['campaigns_analyzed'] += 1
+                    count = self.execution_stats['campaigns_analyzed']
+                    if count % 100 == 0 or count == len(sampled):
+                        self.logger.info('Analyzed %s/%s eligible campaigns', count, len(sampled))
+                    following = next(indices, None)
+                    if following is not None:
+                        pending[executor.submit(analyze, following)] = following
+
+        with open(campaigns_csv, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(['Campaign ID', 'Campaign Name', 'Status', 'Client ID',
+                             'Created At (UTC)', 'Created At (IST)', 'Updated At (UTC)',
+                             'Updated At (IST)', 'Days Since Creation', 'Included in Filter',
+                             'Total Leads', 'No Reply Leads', 'Reply Rate %'])
+            writer.writerows(rows)
+        self.logger.info('Created campaigns analysis: %s', campaigns_csv)
+        return [campaigns[index] for index in sampled]
 
     def select_campaigns_for_deletion(self, filtered_campaigns):
         """Select campaigns to reach target lead count"""
@@ -552,6 +567,7 @@ Total Processing Time: {self.execution_stats['execution_time']:.2f} seconds
 === EXECUTION SUMMARY ===
 ✓ Campaigns Fetched: {self.execution_stats['campaigns_fetched']:,}
 ✓ Campaigns Filtered (eligible): {self.execution_stats['campaigns_filtered']:,}
+✓ Campaigns Analyzed: {self.execution_stats['campaigns_analyzed']:,}
 ✓ Campaigns Selected for deletion: {self.execution_stats['campaigns_selected']:,}
 ✓ Total Leads Exported: {self.execution_stats['total_leads_exported']:,}
 ✓ No-Reply Leads Found: {self.execution_stats['no_reply_leads_found']:,}
@@ -570,6 +586,7 @@ Total Processing Time: {self.execution_stats['execution_time']:.2f} seconds
 • Leads deletion backup CSV
 
 {'Dry run: no leads were deleted.' if dry_run else 'Processing completed. See deletion counts above; CSV backups are not an automatic restore mechanism.'}
+{f'Dry-run sample covering up to {self.sample_campaigns} eligible campaigns. Scheduled cleanup analyzes all eligible campaigns.' if self.sample_campaigns else ''}
 Complete backups and logs are retained in this GitHub Actions run's artifacts.
 """
 
@@ -582,9 +599,12 @@ Complete backups and logs are retained in this GitHub Actions run's artifacts.
         else:
             raise RuntimeError('Resend could not send the completion report')
 
-    def run_full_process(self, dry_run=False, prepare_only=False, state_file='run-state.json'):
+    def run_full_process(self, dry_run=False, prepare_only=False, state_file='run-state.json', sample_campaigns=0):
         """Prepare backups, optionally pausing for durable artifact upload."""
         start_time = time.time()
+        if sample_campaigns < 0 or (sample_campaigns and not dry_run):
+            raise ValueError('Campaign sampling is permitted only with --dry-run')
+        self.sample_campaigns = sample_campaigns
         
         try:
             # Step 1: Fetch all campaigns
@@ -593,7 +613,7 @@ Complete backups and logs are retained in this GitHub Actions run's artifacts.
             
             # Step 2: Filter and analyze campaigns
             self.logger.info("=== STEP 2: Filtering and Analyzing Campaigns ===")
-            filtered_campaigns = self.filter_and_analyze_campaigns(campaigns)
+            filtered_campaigns = self.filter_and_analyze_campaigns(campaigns, sample_campaigns)
             
             # Step 3: Select campaigns for deletion
             self.logger.info("=== STEP 3: Selecting Campaigns for Deletion ===")
@@ -607,6 +627,7 @@ Complete backups and logs are retained in this GitHub Actions run's artifacts.
             self.output_files = [path for path in self.output_files if os.path.isfile(path)]
             with open(state_file, 'w', encoding='utf-8') as handle:
                 json.dump({'backup_file': backup_file,
+                           'sample_campaigns': sample_campaigns, 'dry_run_only': bool(sample_campaigns),
                            'backup_sha256': file_checksum(backup_file) if backup_file else None,
                            'output_files': self.output_files,
                            'log_filename': self.log_filename, 'execution_stats': self.execution_stats}, handle, indent=2)
@@ -625,6 +646,9 @@ Complete backups and logs are retained in this GitHub Actions run's artifacts.
         start_time = time.time()
         with open(state_file, encoding='utf-8') as handle:
             state = json.load(handle)
+        if state.get('dry_run_only') and not dry_run:
+            raise ValueError('A sampled backup is for dry-run validation only; refusing deletion')
+        self.sample_campaigns = state.get('sample_campaigns', 0)
         self.execution_stats = state['execution_stats']
         self.output_files = state['output_files']
         if state['log_filename'] != self.log_filename:
@@ -669,7 +693,12 @@ def main():
     parser = argparse.ArgumentParser(description='SmartLead cleanup with Resend reporting')
     parser.add_argument('--mode', choices=['cleanup', 'prepare', 'execute', 'email-test'], default='cleanup')
     parser.add_argument('--dry-run', action='store_true', help='Export and report without deleting leads')
+    parser.add_argument('--sample-campaigns', type=int, default=0,
+                        help='Dry-run only: analyze up to this many eligible campaigns (0 = all)')
     args = parser.parse_args()
+    if args.sample_campaigns < 0 or (args.sample_campaigns and
+            (not args.dry_run or args.mode not in ('prepare', 'cleanup'))):
+        parser.error('--sample-campaigns requires --dry-run and cleanup/prepare mode')
     processor = None
     try:
         # Validate environment variables
@@ -692,7 +721,8 @@ def main():
         elif args.mode == 'execute':
             processor.run_prepared_process(dry_run=args.dry_run)
         else:
-            processor.run_full_process(dry_run=args.dry_run, prepare_only=args.mode == 'prepare')
+            processor.run_full_process(dry_run=args.dry_run, prepare_only=args.mode == 'prepare',
+                                       sample_campaigns=args.sample_campaigns)
         
     except Exception as e:
         if processor is not None and args.mode == 'execute':

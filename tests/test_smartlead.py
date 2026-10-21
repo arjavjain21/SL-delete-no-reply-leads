@@ -10,9 +10,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
@@ -20,6 +22,24 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import smartlead_consolidated_git as app
+
+_original_request = requests.sessions.Session.request
+
+
+def local_request_only(session, method, url, *args, **kwargs):
+    if urlsplit(url).hostname not in ('127.0.0.1', 'localhost', '::1'):
+        raise AssertionError('Tests must mock external HTTP requests')
+    return _original_request(session, method, url, *args, **kwargs)
+
+
+def setUpModule():
+    global _network_guard
+    _network_guard = patch.object(requests.sessions.Session, 'request', new=local_request_only)
+    _network_guard.start()
+
+
+def tearDownModule():
+    _network_guard.stop()
 
 
 def response(status=200, body=None, headers=None):
@@ -176,6 +196,9 @@ class ResendTests(unittest.TestCase):
 
 class ProcessingTests(unittest.TestCase):
     def setUp(self):
+        email_guard = patch.object(app, 'send_email', return_value=True)
+        email_guard.start()
+        self.addCleanup(email_guard.stop)
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         original = os.getcwd()
@@ -200,6 +223,56 @@ class ProcessingTests(unittest.TestCase):
         backup = pd.read_csv(state['backup_file'], dtype={'id': 'string'})
         self.assertEqual(backup['id'].tolist(), ['123456789012345678', '333'])
         self.assertEqual(state['execution_stats']['leads_backed_up'], 2)
+
+    def test_parallel_analysis_is_bounded_and_preserves_csv_order(self):
+        Path('leads.csv').write_text('id,reply_count\n1,0\n2,1\n')
+        active = [0, 0]
+        lock = threading.Lock()
+
+        def export(*args):
+            with lock:
+                active[0] += 1
+                active[1] = max(active)
+            time.sleep(0.01)
+            with lock:
+                active[0] -= 1
+            return 'leads.csv'
+
+        campaigns = [dict(self.campaign, id=101 + index) for index in range(5)]
+        with patch.object(app, 'ANALYSIS_WORKERS', 2), patch.object(app, 'export_leads_csv', side_effect=export):
+            filtered = self.processor.filter_and_analyze_campaigns(campaigns)
+        self.assertEqual([item['id'] for item in filtered], [101, 102, 103, 104, 105])
+        summary = pd.read_csv(self.processor.output_files[-1])
+        self.assertEqual(summary['Campaign ID'].tolist(), [101, 102, 103, 104, 105])
+        self.assertEqual(summary['No Reply Leads'].tolist(), [1] * 5)
+        self.assertEqual(active[1], 2)
+        self.assertEqual(self.processor.execution_stats['campaigns_analyzed'], 5)
+
+    def test_sampling_requires_dry_run_before_any_api_access(self):
+        with patch.object(app, 'fetch_all_campaigns') as fetch:
+            with self.assertRaisesRegex(ValueError, 'only with --dry-run'):
+                self.processor.run_full_process(sample_campaigns=1)
+        fetch.assert_not_called()
+
+    def test_sample_counts_eligible_campaigns_and_cannot_be_deleted(self):
+        Path('leads.csv').write_text('id,reply_count\n1,0\n2,1\n')
+        campaigns = [dict(self.campaign, id=100, status='ACTIVE'), self.campaign,
+                     dict(self.campaign, id=102), dict(self.campaign, id=103, client_id=1598)]
+        with patch.object(app, 'fetch_all_campaigns', return_value=campaigns), \
+             patch.object(app, 'export_leads_csv', return_value='leads.csv') as export:
+            self.processor.run_full_process(dry_run=True, prepare_only=True, sample_campaigns=1)
+        self.assertEqual(self.processor.execution_stats['campaigns_filtered'], 2)
+        self.assertEqual(self.processor.execution_stats['campaigns_analyzed'], 1)
+        self.assertTrue(all(call.args[1] == 101 for call in export.call_args_list))
+        summary = pd.read_csv(self.processor.output_files[0])
+        self.assertEqual(summary['Included in Filter'].tolist(), ['No', 'Yes', 'Not sampled', 'No'])
+        with patch.object(self.processor, 'delete_leads') as delete:
+            with self.assertRaisesRegex(ValueError, 'sampled backup'):
+                self.processor.run_prepared_process(dry_run=False)
+        delete.assert_not_called()
+        with patch.object(app, 'send_email', return_value=True) as email:
+            self.processor.run_prepared_process(dry_run=True)
+        self.assertIn('Dry-run sample', email.call_args.args[1])
 
     def test_execute_prepared_backup_and_send_report(self):
         self.prepare()
@@ -227,7 +300,7 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(self.processor.execution_stats['leads_backed_up'], 0)
 
     def test_excluded_client_and_active_campaign_not_exported(self):
-        self.prepare(campaigns=[dict(self.campaign, client_id=1598), dict(self.campaign, status='ACTIVE')])
+        self.prepare(campaigns=[dict(self.campaign, client_id=1598), dict(self.campaign, id=102, status='ACTIVE')])
         self.assertEqual(self.processor.execution_stats['campaigns_filtered'], 0)
 
     def test_reply_lead_or_missing_id_refuses_entire_deletion(self):

@@ -14,6 +14,10 @@ on:
         description: Export and report without deleting leads (cleanup mode)
         type: boolean
         default: true
+      sample_campaigns:
+        description: Dry-run only; eligible campaigns to analyze (0 = all)
+        type: number
+        default: 0
   schedule:
     - cron: "0 7 * * *" # Daily at 07:00 UTC / 12:30 PM IST
 
@@ -38,8 +42,10 @@ jobs:
       EXCLUDE_CLIENT_IDS: ${{ vars.EXCLUDE_CLIENT_IDS || '1598' }}
       SMARTLEAD_REQUESTS_PER_MINUTE: ${{ vars.SMARTLEAD_REQUESTS_PER_MINUTE || '5400' }}
       DELETE_WORKERS: ${{ vars.DELETE_WORKERS || '10' }}
+      ANALYSIS_WORKERS: ${{ vars.ANALYSIS_WORKERS || '16' }}
       RUN_MODE: ${{ inputs.mode || 'cleanup' }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+      SAMPLE_CAMPAIGNS: ${{ inputs.sample_campaigns || '0' }}
       PYTHONUNBUFFERED: '1'
 
     steps:
@@ -69,7 +75,13 @@ jobs:
       - name: Prepare cleanup and CSV backups
         if: env.RUN_MODE == 'cleanup'
         working-directory: run-output
-        run: python ../smartlead_consolidated_git.py --mode prepare
+        shell: bash
+        run: |
+          args=(--mode prepare --sample-campaigns "$SAMPLE_CAMPAIGNS")
+          if [[ "$DRY_RUN" == 'true' ]]; then
+            args+=(--dry-run)
+          fi
+          python ../smartlead_consolidated_git.py "${args[@]}"
 
       # If this upload fails, execution stops before any deletion.
       - name: Save backup before deleting any leads

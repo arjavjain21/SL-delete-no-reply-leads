@@ -37,6 +37,7 @@ Actions variables are optional; empty or missing values use these defaults:
 | `EXCLUDE_CLIENT_IDS` | `1598` | Comma-separated client IDs excluded from cleanup |
 | `SMARTLEAD_REQUESTS_PER_MINUTE` | `5400` | Shared limit for all SmartLead attempts, including retries; maximum `6000` |
 | `DELETE_WORKERS` | `10` | Concurrent deletion workers; range `1`–`32` |
+| `ANALYSIS_WORKERS` | `16` | Concurrent campaign exports/analysis; range `1`–`32` |
 
 The rate limit applies to this process. Other jobs or applications using the same
 SmartLead account share its 6,000 requests/minute allowance; lower this setting
@@ -52,8 +53,12 @@ After the workflow changes are on the default branch:
    `mode: email-test`. This sends one connection-test email through Resend and
    does not access SmartLead or delete anything.
 2. Run again with `mode: cleanup` and **dry_run enabled** (the manual default).
+   For a quick connection/backup/report check, set `sample_campaigns: 25`.
    Inspect the email, selected campaigns, and downloaded backup artifacts.
+   Use `sample_campaigns: 0` (the default) to analyze all eligible campaigns;
+   large accounts may require substantial time even with parallel exports.
 3. To delete the selected no-reply leads, run with **dry_run disabled**.
+   Keep `sample_campaigns: 0`; sampled backups cannot be executed for deletion.
 
 The active schedule runs a real cleanup every day at **07:00 UTC / 12:30 PM IST**.
 If GitHub marked the workflow disabled due to inactivity or manual disabling,
@@ -65,6 +70,11 @@ Eligibility preserves the existing behavior: only `PAUSED` or `COMPLETED`
 campaigns old enough by creation date and outside the excluded clients are
 selected. Within those campaigns, only leads with `reply_count == 0` are backed
 up for deletion. No eligible campaigns is a successful no-op, not a job failure.
+Scheduled cleanup always analyzes all eligible campaigns. Sampling is restricted
+to dry-run validation, labels unexamined eligible campaigns `Not sampled`, and
+labels its report as a sample. Even a separate execute command refuses to delete
+from a sampled backup. Parallel analysis keeps at most `ANALYSIS_WORKERS` exports
+in flight, shares the request limiter with deletion, and preserves CSV row order.
 
 The workflow splits preparation and execution. It **uploads the complete backup
 before deletion begins**; a failed upload prevents deletion. Final exports and
@@ -103,7 +113,7 @@ directory, and run with `--dry-run` first:
 ```bash
 mkdir -p run-output
 cd run-output
-python ../smartlead_consolidated_git.py --dry-run
+python ../smartlead_consolidated_git.py --dry-run --sample-campaigns 25
 ```
 
 The script reads exported process variables; it does not load `.env` files.
