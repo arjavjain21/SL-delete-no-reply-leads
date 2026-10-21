@@ -1,36 +1,102 @@
-# name: SmartLead Lead Deletion
+name: SmartLead Lead Deletion
 
-# on:
-#   workflow_dispatch:   # Allow manual trigger
-#   schedule:
-#     - cron: "0 7 * * *" # 7:00 AM UTC daily (7:30 PM IST)
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run cleanup or send a Resend connection test only
+        type: choice
+        options:
+          - cleanup
+          - email-test
+        default: cleanup
+      dry_run:
+        description: Export and report without deleting leads (cleanup mode)
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 7 * * *" # Daily at 07:00 UTC / 12:30 PM IST
 
-# jobs:
-#   smartlead-cleanup:
-#     runs-on: ubuntu-latest
-    
-#     steps:
-#       - name: Checkout repo
-#         uses: actions/checkout@v4
-        
-#       - name: Set up Python
-#         uses: actions/setup-python@v5
-#         with:
-#           python-version: "3.11"
-          
-#       - name: Install dependencies
-#         run: |
-#           python -m pip install --upgrade pip
-#           pip install -r requirements.txt
-          
-#       - name: Run SmartLead Cleanup Script
-#         env:
-#           SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
-#           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-#           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
-#           RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
-#           TARGET_LEADS: ${{ vars.TARGET_LEADS }}
-#           DAYS_WITHOUT_ACTIVITY: ${{ vars.DAYS_WITHOUT_ACTIVITY }}
-#           EXCLUDE_CLIENT_IDS: ${{ vars.EXCLUDE_CLIENT_IDS }}
-#         run: |
-#           python smartlead_consolidated_git.py
+permissions:
+  contents: read
+
+concurrency:
+  group: smartlead-cleanup
+  cancel-in-progress: false
+
+jobs:
+  smartlead-cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      SENDER_EMAIL: ${{ vars.SENDER_EMAIL || 'SmartLead Reports <reports@clientupdates.eagleinfoservice.com>' }}
+      RECIPIENT_EMAILS: ${{ vars.RECIPIENT_EMAILS || 'arjav@eagleinfoservice.com' }}
+      TARGET_LEADS: ${{ vars.TARGET_LEADS || '20000' }}
+      DAYS_WITHOUT_ACTIVITY: ${{ vars.DAYS_WITHOUT_ACTIVITY || '30' }}
+      EXCLUDE_CLIENT_IDS: ${{ vars.EXCLUDE_CLIENT_IDS || '1598' }}
+      SMARTLEAD_REQUESTS_PER_MINUTE: ${{ vars.SMARTLEAD_REQUESTS_PER_MINUTE || '5400' }}
+      DELETE_WORKERS: ${{ vars.DELETE_WORKERS || '10' }}
+      RUN_MODE: ${{ inputs.mode || 'cleanup' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Create output directory
+        run: mkdir -p run-output
+
+      - name: Test Resend connection only
+        if: env.RUN_MODE == 'email-test'
+        working-directory: run-output
+        run: python ../smartlead_consolidated_git.py --mode email-test
+
+      - name: Prepare cleanup and CSV backups
+        if: env.RUN_MODE == 'cleanup'
+        working-directory: run-output
+        run: python ../smartlead_consolidated_git.py --mode prepare
+
+      # If this upload fails, execution stops before any deletion.
+      - name: Save backup before deleting any leads
+        if: env.RUN_MODE == 'cleanup'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartlead-before-deletion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: run-output/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Execute cleanup or dry run and send report
+        if: env.RUN_MODE == 'cleanup'
+        working-directory: run-output
+        shell: bash
+        run: |
+          args=(--mode execute)
+          if [[ "$DRY_RUN" == 'true' ]]; then
+            args+=(--dry-run)
+          fi
+          python ../smartlead_consolidated_git.py "${args[@]}"
+
+      - name: Retain final logs and exports even after failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartlead-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: run-output/
+          retention-days: 30
+          if-no-files-found: warn
