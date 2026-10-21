@@ -31,8 +31,8 @@ jobs:
     env:
       SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-      SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-      RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+      SENDER_EMAIL: ${{ vars.SENDER_EMAIL || 'SmartLead Reports <reports@clientupdates.eagleinfoservice.com>' }}
+      RECIPIENT_EMAILS: ${{ vars.RECIPIENT_EMAILS || 'arjav@eagleinfoservice.com' }}
       TARGET_LEADS: ${{ vars.TARGET_LEADS || '20000' }}
       DAYS_WITHOUT_ACTIVITY: ${{ vars.DAYS_WITHOUT_ACTIVITY || '30' }}
       EXCLUDE_CLIENT_IDS: ${{ vars.EXCLUDE_CLIENT_IDS || '1598' }}

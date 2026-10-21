@@ -13,8 +13,15 @@ Create or retain these repository secrets:
 | --- | --- |
 | `SMARTLEAD_API_KEY` | Existing SmartLead account API key |
 | `RESEND_API_KEY` | Resend API key with permission to send from your verified domain |
-| `SENDER_EMAIL` | Address on that verified domain, optionally `Name <address@example.com>` |
-| `RECIPIENT_EMAILS` | Comma-separated report recipient addresses |
+
+The workflow defaults to sender
+`SmartLead Reports <reports@clientupdates.eagleinfoservice.com>` and recipient
+`arjav@eagleinfoservice.com`. Verify `clientupdates.eagleinfoservice.com` in
+Resend before running. Resend permits any sender local part on a verified domain;
+creating a separate mailbox for `reports` is not required for sending.
+Optional Actions **variables** `SENDER_EMAIL` and `RECIPIENT_EMAILS` override these
+addresses. The workflow no longer reads the old email-address secrets, so an old
+Gmail sender secret cannot accidentally override the Resend domain.
 
 Store credentials only in secrets, never in source or workflow YAML. Rotate any
 key previously shared in chat. `EMAIL_APP_PASSWORD` is no longer referenced and
@@ -81,8 +88,10 @@ python -m unittest discover -s tests -v
 ```
 
 Tests use simulated HTTP responses and temporary files. They never send email
-or delete real leads. For a local live connection test, securely export the three
-email configuration variables above, then run:
+or delete real leads. For a local live connection test, securely export
+`RESEND_API_KEY`, set `SENDER_EMAIL` to
+`SmartLead Reports <reports@clientupdates.eagleinfoservice.com>` and
+`RECIPIENT_EMAILS` to `arjav@eagleinfoservice.com`, then run:
 
 ```bash
 python smartlead_consolidated_git.py --mode email-test
