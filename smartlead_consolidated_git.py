@@ -698,6 +698,10 @@ def main():
         if processor is not None and args.mode == 'execute':
             processor.send_failure_email(str(e))
         print(f"Critical error: {e}")
+        if os.environ.get('GITHUB_ACTIONS') == 'true':
+            # Surface the precise failure on the run page, even without log access.
+            message = str(e).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+            print(f'::error::{message}')
         exit(1)
 
 if __name__ == "__main__":

@@ -31,6 +31,14 @@ def response(status=200, body=None, headers=None):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_missing_resend_key_has_actionable_github_annotation(self):
+        settings = dict(os.environ, RESEND_API_KEY='', GITHUB_ACTIONS='true',
+                        SENDER_EMAIL='sender@example.com', RECIPIENT_EMAILS='recipient@example.com')
+        result = subprocess.run([sys.executable, str(ROOT / 'smartlead_consolidated_git.py'),
+                                 '--mode', 'email-test'], env=settings, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('::error::Missing required environment variables: RESEND_API_KEY', result.stdout)
+
     def test_empty_github_variables_use_defaults(self):
         with patch.dict(os.environ, {key: '' for key in [
             'TARGET_LEADS', 'DAYS_WITHOUT_ACTIVITY', 'EXCLUDE_CLIENT_IDS',
