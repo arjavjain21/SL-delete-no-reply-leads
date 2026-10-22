@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -129,6 +130,25 @@ class DrainTests(unittest.TestCase):
         args = drain.app.send_email.call_args.args
         self.assertIn('No total lead target', args[1])
         self.assertIn('continuation run is queued', args[1])
+
+    def test_empty_campaign_scan_keeps_later_export_windows_parallel(self):
+        self.campaigns = [dict(self.campaigns[0], id=number) for number in range(101, 107)]
+        self.rows = {str(number): [] for number in range(101, 107)}
+        export = drain.app.export_leads_csv.side_effect
+        second_window = threading.Barrier(2)
+
+        def synchronized_export(key, campaign_id, logger):
+            if campaign_id in (103, 104):
+                second_window.wait(timeout=2)
+            return export(key, campaign_id, logger)
+
+        with patch.object(drain.app, 'ANALYSIS_WORKERS', 2), \
+             patch.object(drain.app, 'export_leads_csv', side_effect=synchronized_export):
+            drain.plan()
+            batch = drain.prepare(batch_size=1)
+        self.assertIsNone(batch['backup_file'])
+        self.assertEqual(drain.load()['confirmed_after'], 106)
+        self.assertTrue(drain.load()['done'])
 
     def test_deletion_deadline_does_not_start_another_request(self):
         processor = drain.app.SmartLeadProcessor('test-only', drain.LOG, 'test.log')
