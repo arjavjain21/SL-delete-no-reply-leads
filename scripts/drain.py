@@ -97,9 +97,13 @@ def prepare(batch_size=10000):
     while len(rows) < batch_size and state['index'] < len(state['campaigns']):
         if time.time() >= state['deadline']:
             break
-        prefetch(state)
         campaign = state['campaigns'][state['index']]
         export = Path(f"exports/leads_campaign_{campaign['id']}.csv")
+        if not export.is_file():
+            # Consume the downloaded window before fetching the next window.
+            # Refilling one file synchronously for each empty campaign would
+            # accidentally serialize exports after the initial parallel fetch.
+            prefetch(state)
         exhausted = True
         with export.open(encoding='utf-8-sig', newline='') as handle:
             reader = csv.DictReader(handle)
