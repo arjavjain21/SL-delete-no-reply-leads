@@ -1,7 +1,10 @@
 # SmartLead cleanup with Resend
 
-A daily GitHub Actions job exports and deletes no-reply leads from eligible
-SmartLead campaigns, then sends a report through the Resend HTTPS API.
+A daily GitHub Actions job deletes **all** no-reply leads from PAUSED or COMPLETED
+campaigns created at least 30 days ago, excluding client 1598, and reports through
+Resend. The age rule applies to the campaign, so newer leads within an old
+campaign can qualify. Cleanup is performed in backed-up batches with automatic
+continuation; it has no total lead target in the default `all` scope.
 Gmail SMTP credentials are no longer used.
 
 ## Configure GitHub Actions
@@ -32,12 +35,14 @@ Actions variables are optional; empty or missing values use these defaults:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TARGET_LEADS` | `20000` | Approximate target; whole campaigns may exceed it |
+| `TARGET_LEADS` | `20000` | Used only by optional legacy `target` scope; ignored by default `all` cleanup |
 | `DAYS_WITHOUT_ACTIVITY` | `30` | Existing behavior: minimum **campaign age since creation**, not last activity |
 | `EXCLUDE_CLIENT_IDS` | `1598` | Comma-separated client IDs excluded from cleanup |
 | `SMARTLEAD_REQUESTS_PER_MINUTE` | `5400` | Shared limit for all SmartLead attempts, including retries; maximum `6000` |
 | `DELETE_WORKERS` | `10` | Concurrent deletion workers; range `1`–`32` |
 | `ANALYSIS_WORKERS` | `16` | Concurrent campaign exports/analysis; range `1`–`32` |
+| `DELETE_BATCH_SIZE` | `10000` | Maximum candidate rows per backup/deletion batch, range `1`–`50000`; not a total cleanup limit |
+| `CLEANUP_BUDGET_MINUTES` | `120` | Work budget before automatic continuation; range `1`–`140` |
 
 The rate limit applies to this process. Other jobs or applications using the same
 SmartLead account share its 6,000 requests/minute allowance; lower this setting
@@ -52,12 +57,12 @@ After the workflow changes are on the default branch:
 1. Open **Actions → SmartLead Lead Deletion → Run workflow**. Choose
    `mode: email-test`. This sends one connection-test email through Resend and
    does not access SmartLead or delete anything.
-2. Run again with `mode: cleanup` and **dry_run enabled** (the manual default).
+2. Run again with `mode: cleanup`, `cleanup_scope: all`, and **dry_run enabled** (the manual default).
    For a quick connection/backup/report check, set `sample_campaigns: 25`.
    Inspect the email, selected campaigns, and downloaded backup artifacts.
    Use `sample_campaigns: 0` (the default) to analyze all eligible campaigns;
    large accounts may require substantial time even with parallel exports.
-3. To delete the selected no-reply leads, run with **dry_run disabled**.
+3. To delete all qualifying no-reply leads, use `cleanup_scope: all` and **dry_run disabled**.
    Keep `sample_campaigns: 0`; sampled backups cannot be executed for deletion.
 
 The active schedule runs a real cleanup every day at **07:00 UTC / 12:30 PM IST**.
@@ -76,14 +81,31 @@ labels its report as a sample. Even a separate execute command refuses to delete
 from a sampled backup. Parallel analysis keeps at most `ANALYSIS_WORKERS` exports
 in flight, shares the request limiter with deletion, and preserves CSV row order.
 
-The workflow splits preparation and execution. It **uploads the complete backup
-before deletion begins**; a failed upload prevents deletion. Final exports and
+In the default `all` scope, the workflow prefetches at most 16 campaign exports
+and prepares at most 10,000 candidate rows at a time. It **uploads each complete
+batch backup before deleting that batch**; failed uploads prevent deletion.
+Backups include campaign age/status/client metadata, are checked for integrity,
+and are retained as immutable artifacts. Local copies are removed after the
+backed-up batch completes to bound memory and disk use.
+
+At its work budget or artifact-count limit, the workflow dispatches a continuation
+using the last fully committed campaign ID. A partial campaign is re-exported on
+continuation, so unfinished leads are not skipped. One concurrency group prevents
+runs sharing this account from overlapping. Errors stop cleanup and send a failure
+report; a later fresh run can safely revisit remaining server-side leads. The
+workflow needs `actions: write` only to queue its own continuation. Leave the
+advanced `resume_after_campaign` input at `0` for a fresh cleanup. Each run emails
+its own deletion counts and whether more work was queued. Large backlogs can
+require multiple runs and several hours; 100,000 DELETE requests alone take at
+least about 19 minutes at 5,400 requests/minute, before latency and retry costs.
+
+The optional legacy `target` scope keeps the previous whole-campaign selection
+and one-backup execution path. Its target can be exceeded by a large campaign. Final exports and
 logs are also uploaded on failure. Artifacts are retained for 30 days, subject to
 repository retention settings; they contain lead data and should be access
 controlled. CSV backups preserve data but do not automatically restore deleted
-leads. Emails include CSVs/logs when their combined raw size fits the 20 MiB
-attachment budget; larger files remain available in Actions artifacts and are
-listed as omitted in the email. Resend API acceptance is not a guarantee of inbox
+leads. All-leads reports attach logs and link to the run for all batch backups.
+Legacy target reports attach CSVs/logs up to the 20 MiB raw attachment budget. Resend API acceptance is not a guarantee of inbox
 delivery; check Resend delivery events if an accepted message does not arrive.
 
 ## Local development

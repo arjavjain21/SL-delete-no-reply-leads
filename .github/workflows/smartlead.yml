@@ -18,11 +18,23 @@ on:
         description: Dry-run only; eligible campaigns to analyze (0 = all)
         type: number
         default: 0
+      cleanup_scope:
+        description: Delete all qualifying leads, or use the legacy target batch
+        type: choice
+        options:
+          - all
+          - target
+        default: all
+      resume_after_campaign:
+        description: Continuation cursor; leave 0 for a new cleanup
+        type: string
+        default: '0'
   schedule:
     - cron: "0 7 * * *" # Daily at 07:00 UTC / 12:30 PM IST
 
 permissions:
   contents: read
+  actions: write # Queue a continuation when an all-leads run reaches its work budget.
 
 concurrency:
   group: smartlead-cleanup
@@ -46,6 +58,10 @@ jobs:
       RUN_MODE: ${{ inputs.mode || 'cleanup' }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
       SAMPLE_CAMPAIGNS: ${{ inputs.sample_campaigns || '0' }}
+      CLEANUP_SCOPE: ${{ inputs.cleanup_scope || 'all' }}
+      RESUME_AFTER_CAMPAIGN: ${{ inputs.resume_after_campaign || '0' }}
+      DELETE_BATCH_SIZE: ${{ vars.DELETE_BATCH_SIZE || '10000' }}
+      CLEANUP_BUDGET_MINUTES: ${{ vars.CLEANUP_BUDGET_MINUTES || '120' }}
       PYTHONUNBUFFERED: '1'
 
     steps:
@@ -72,8 +88,20 @@ jobs:
         working-directory: run-output
         run: python ../smartlead_consolidated_git.py --mode email-test
 
+      - name: Install the artifact client for all-leads cleanup
+        if: env.RUN_MODE == 'cleanup' && env.CLEANUP_SCOPE == 'all'
+        run: npm install --prefix "$RUNNER_TEMP/smartlead-artifact" --no-save --ignore-scripts @actions/artifact@6.3.1
+
+      - name: Drain all eligible leads in backed-up batches
+        if: env.RUN_MODE == 'cleanup' && env.CLEANUP_SCOPE == 'all'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const drain = require(`${process.env.GITHUB_WORKSPACE}/scripts/drain.cjs`);
+            await drain({core, github, context});
+
       - name: Prepare cleanup and CSV backups
-        if: env.RUN_MODE == 'cleanup'
+        if: env.RUN_MODE == 'cleanup' && env.CLEANUP_SCOPE == 'target'
         working-directory: run-output
         shell: bash
         run: |
@@ -85,7 +113,7 @@ jobs:
 
       # If this upload fails, execution stops before any deletion.
       - name: Save backup before deleting any leads
-        if: env.RUN_MODE == 'cleanup'
+        if: env.RUN_MODE == 'cleanup' && env.CLEANUP_SCOPE == 'target'
         uses: actions/upload-artifact@v4
         with:
           name: smartlead-before-deletion-${{ github.run_id }}-${{ github.run_attempt }}
@@ -94,7 +122,7 @@ jobs:
           if-no-files-found: error
 
       - name: Execute cleanup or dry run and send report
-        if: env.RUN_MODE == 'cleanup'
+        if: env.RUN_MODE == 'cleanup' && env.CLEANUP_SCOPE == 'target'
         working-directory: run-output
         shell: bash
         run: |

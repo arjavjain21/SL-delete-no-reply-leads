@@ -484,7 +484,7 @@ class SmartLeadProcessor:
         self.logger.warning("No leads found for backup")
         return None, pd.DataFrame()
 
-    def delete_leads(self, backup_df):
+    def delete_leads(self, backup_df, deadline=None, stop_on_failure=False):
         """Delete leads using SmartLead API"""
         if backup_df.empty:
             self.logger.info("No leads to delete")
@@ -509,6 +509,8 @@ class SmartLeadProcessor:
         with ThreadPoolExecutor(max_workers=DELETE_WORKERS) as executor:
             # Bound each batch so an authentication failure cannot queue the whole backup.
             for offset in range(0, len(pairs), DELETE_WORKERS):
+                if deadline is not None and time.time() >= deadline:
+                    return False
                 batch = pairs[offset:offset + DELETE_WORKERS]
                 results = executor.map(lambda pair: self.delete_single_lead(*pair), batch)
                 for success in results:
@@ -516,6 +518,8 @@ class SmartLeadProcessor:
                     failed_count += int(not success)
                     self.execution_stats['leads_deleted_success'] = success_count
                     self.execution_stats['leads_deleted_failed'] = failed_count
+                if stop_on_failure and failed_count:
+                    raise RuntimeError('Lead deletion failed; stopping this batch for review')
                 processed = success_count + failed_count
                 if processed // 100 > offset // 100 or processed == len(pairs):
                     self.logger.info('Progress: %s/%s processed', processed, len(pairs))
@@ -524,6 +528,7 @@ class SmartLeadProcessor:
         self.execution_stats['leads_deleted_failed'] = failed_count
         
         self.logger.info(f"Deletion completed: {success_count:,} successful, {failed_count:,} failed")
+        return True
 
     def delete_single_lead(self, campaign_id, lead_id):
         """Delete a single lead via API"""
