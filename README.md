@@ -112,13 +112,17 @@ delivery; check Resend delivery events if an accepted message does not arrive.
 
 ## Local development
 
-Python 3.11 is used by the workflow. No new runtime dependencies are required.
+Python 3.11 and Node are used by the workflow. The all-leads controller installs
+`@actions/artifact@6.3.1` in the temporary runner directory for durable uploads.
+Offline development needs the existing Python requirements and Node; the controller
+tests use Node's built-in test runner and mocked uploads.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
+node --test tests/drain-controller.test.cjs
 ```
 
 Tests use simulated HTTP responses and temporary files. They never send email
@@ -131,6 +135,8 @@ or delete real leads. For a local live connection test, securely export
 python smartlead_consolidated_git.py --mode email-test
 ```
 
+Use GitHub Actions for the default all-leads cleanup and automatic continuations.
+The local command below exercises the legacy target-based Python entry point.
 For local cleanup, also securely export `SMARTLEAD_API_KEY`, create an output
 directory, and run with `--dry-run` first:
 
