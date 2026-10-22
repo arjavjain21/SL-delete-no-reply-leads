@@ -87,6 +87,8 @@ batch backup before deleting that batch**; failed uploads prevent deletion.
 Backups include campaign age/status/client metadata, are checked for integrity,
 and are retained as immutable artifacts. Local copies are removed after the
 backed-up batch completes to bound memory and disk use.
+The first batch contains at most 1,000 candidates to verify the live path promptly;
+subsequent batches use the configured size.
 
 At its work budget or artifact-count limit, the workflow dispatches a continuation
 using the last fully committed campaign ID. A partial campaign is re-exported on

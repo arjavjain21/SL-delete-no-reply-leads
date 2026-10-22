@@ -31,7 +31,9 @@ module.exports = async ({core, github, context}) => {
     while (true) {
       const current = read('drain-state.json');
       if (current.done || Date.now() / 1000 >= current.deadline || current.batch_number >= 400) break;
-      run('prepare', '--batch-size', String(batchSize));
+      // Verify the live path promptly with a small first batch, then use the
+      // configured working size for the rest of this unbounded cleanup.
+      run('prepare', '--batch-size', String(current.batch_number === 0 ? Math.min(1000, batchSize) : batchSize));
       let batch = read('batch.json');
       if (batch.backup_file) {
         const name = `smartlead-backup-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-${batch.number}-after-${current.stats.leads_deleted_success}`;

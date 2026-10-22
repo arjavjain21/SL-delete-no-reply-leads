@@ -241,7 +241,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
                         handlers=[logging.FileHandler('cleanup.log'), logging.StreamHandler()])
     try:
-        app.validate_environment()
+        app.validate_environment(target_mode=False)
         if args.command == 'plan':
             plan(args.resume_after, args.dry_run, args.sample_campaigns, args.budget_minutes)
         elif args.command == 'prepare':

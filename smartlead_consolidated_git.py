@@ -52,7 +52,7 @@ GITHUB_SERVER_URL = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')
 MAX_RETRIES = 5
 BACKOFF_FACTOR = 2
 
-def validate_environment(require_smartlead=True):
+def validate_environment(require_smartlead=True, target_mode=True):
     """Validate that all required environment variables are set"""
     required_vars = {
         'SENDER_EMAIL': SENDER_EMAIL,
@@ -66,8 +66,10 @@ def validate_environment(require_smartlead=True):
     
     if missing_vars:
         raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    if TARGET_LEADS <= 0 or DAYS_WITHOUT_ACTIVITY < 0:
-        raise ValueError('TARGET_LEADS must be positive and DAYS_WITHOUT_ACTIVITY must be nonnegative')
+    if target_mode and TARGET_LEADS <= 0:
+        raise ValueError('TARGET_LEADS must be positive')
+    if DAYS_WITHOUT_ACTIVITY < 0:
+        raise ValueError('DAYS_WITHOUT_ACTIVITY must be nonnegative')
     if not 1 <= SMARTLEAD_REQUESTS_PER_MINUTE <= 6000:
         raise ValueError('SMARTLEAD_REQUESTS_PER_MINUTE must be between 1 and 6000')
     if not 1 <= DELETE_WORKERS <= 32:
@@ -76,7 +78,10 @@ def validate_environment(require_smartlead=True):
         raise ValueError('ANALYSIS_WORKERS must be between 1 and 32')
     
     print(f"✅ Configuration loaded from environment variables")
-    print(f"✅ Target leads: {TARGET_LEADS:,}")
+    if target_mode:
+        print(f"✅ Target leads: {TARGET_LEADS:,}")
+    else:
+        print('✅ Cleanup scope: all qualifying leads (no total lead target)')
     print(f"✅ Days filter: {DAYS_WITHOUT_ACTIVITY}")
     print(f"✅ Excluded client IDs: {EXCLUDE_CLIENT_IDS}")
     print(f"✅ Recipients: {len(RECIPIENT_EMAILS)}")
