@@ -489,17 +489,9 @@ class SmartLeadProcessor:
         self.logger.warning("No leads found for backup")
         return None, pd.DataFrame()
 
-    def delete_leads(self, backup_df, deadline=None, stop_on_failure=False):
-        """Delete leads using SmartLead API"""
-        if backup_df.empty:
-            self.logger.info("No leads to delete")
-            return
-            
-        self.logger.info(f"Starting deletion of {len(backup_df):,} leads...")
-        
-        success_count = 0
-        failed_count = 0
-        
+    @staticmethod
+    def validate_deletion_backup(backup_df):
+        """Check deletion candidates without making requests (also used by dry runs)."""
         required = {'Campaign ID', 'id', 'reply_count'}
         if not required.issubset(backup_df.columns):
             raise ValueError('Deletion backup is missing Campaign ID, id or reply_count')
@@ -510,6 +502,18 @@ class SmartLeadProcessor:
             raise ValueError('Deletion backup must contain integer campaign and lead IDs')
         if len(set(pairs)) != len(pairs):
             raise ValueError('Deletion backup contains duplicate campaign/lead IDs')
+        return pairs
+
+    def delete_leads(self, backup_df, deadline=None, stop_on_failure=False):
+        """Delete leads using SmartLead API"""
+        if backup_df.empty:
+            self.logger.info("No leads to delete")
+            return
+
+        pairs = self.validate_deletion_backup(backup_df)
+        self.logger.info(f"Starting deletion of {len(backup_df):,} leads...")
+        success_count = 0
+        failed_count = 0
 
         with ThreadPoolExecutor(max_workers=DELETE_WORKERS) as executor:
             # Bound each batch so an authentication failure cannot queue the whole backup.

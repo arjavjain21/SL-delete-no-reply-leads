@@ -7,12 +7,14 @@ Only the last completely committed campaign is used as a continuation cursor.
 import argparse
 import csv
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import itertools
 import json
 import logging
 from pathlib import Path
+import sqlite3
 import sys
 import time
 
@@ -70,7 +72,8 @@ def plan(resume_after=0, dry_run=False, sample=0, budget_minutes=120):
              'batch_number': 0, 'stats': {'campaigns_fetched': len(campaigns),
              'eligible_remaining_at_start': eligible_count, 'campaigns_scanned': 0,
              'leads_backed_up': 0, 'leads_deleted_success': 0, 'leads_deleted_failed': 0,
-             'unknown_reply_counts': 0, 'backups_uploaded': 0}}
+             'unknown_reply_counts': 0, 'duplicate_export_rows': 0,
+             'conflicting_duplicate_leads_kept': 0, 'backups_uploaded': 0}}
     save(STATE, state)
     LOG.info('All-leads plan: %s campaigns total; %s eligible remaining; %s in this run%s',
              len(campaigns), eligible_count, len(eligible), ' (sample dry run)' if sample else '')
@@ -89,6 +92,71 @@ def prefetch(state):
                 raise RuntimeError('Campaign export failed')
 
 
+def normalize_export(export, state):
+    """Resolve the entire campaign before batching, including late conflicts.
+
+    SmartLead can repeat a lead in one export. A lead qualifies only if every
+    occurrence has a known zero reply count. SQLite bounds memory independently
+    of campaign size; the original deletion-time duplicate guard stays enabled.
+    """
+    database = export.with_suffix('.sqlite')
+    normalized = export.with_suffix('.unique.csv')
+    total = unknown = 0
+    try:
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute('PRAGMA cache_size = -2048')
+            connection.execute('''CREATE TABLE leads (
+                id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, data TEXT,
+                eligible INTEGER NOT NULL, had_zero INTEGER NOT NULL
+            ) WITHOUT ROWID''')
+            with export.open(encoding='utf-8-sig', newline='') as handle:
+                reader = csv.DictReader(handle)
+                columns = reader.fieldnames
+                if not {'id', 'reply_count'}.issubset(columns or []):
+                    raise ValueError('Lead export is missing id or reply_count')
+                for ordinal, row in enumerate(reader):
+                    lead_id = row['id']
+                    if not lead_id or not lead_id.isascii() or not lead_id.isdecimal():
+                        raise ValueError('Lead export has an invalid lead ID')
+                    row['id'] = str(int(lead_id))
+                    try:
+                        count = Decimal(row['reply_count'])
+                        if not count.is_finite():
+                            raise InvalidOperation
+                        eligible = count == 0
+                    except (InvalidOperation, TypeError, ValueError):
+                        unknown += 1
+                        eligible = False
+                    connection.execute('''INSERT INTO leads VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            data = COALESCE(leads.data, excluded.data),
+                            eligible = MIN(leads.eligible, excluded.eligible),
+                            had_zero = MAX(leads.had_zero, excluded.had_zero)''',
+                        (row['id'], ordinal, json.dumps(row) if eligible else None,
+                         int(eligible), int(eligible)))
+                    total += 1
+            unique = connection.execute('SELECT COUNT(*) FROM leads').fetchone()[0]
+            conflicts = connection.execute(
+                'SELECT COUNT(*) FROM leads WHERE had_zero = 1 AND eligible = 0').fetchone()[0]
+            with normalized.open('w', encoding='utf-8', newline='') as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns)
+                writer.writeheader()
+                for (data,) in connection.execute(
+                        'SELECT data FROM leads WHERE eligible = 1 ORDER BY ordinal'):
+                    writer.writerow(json.loads(data))
+        normalized.replace(export)
+        state['stats']['unknown_reply_counts'] += unknown
+        state['stats']['duplicate_export_rows'] += total - unique
+        state['stats']['conflicting_duplicate_leads_kept'] += conflicts
+        if total != unique or unknown:
+            LOG.info('Campaign %s export: %s duplicate rows removed; %s conflicting leads kept; '
+                     '%s unknown reply counts', state['campaigns'][state['index']]['id'],
+                     total - unique, conflicts, unknown)
+    finally:
+        database.unlink(missing_ok=True)
+        normalized.unlink(missing_ok=True)
+
+
 def prepare(batch_size=10000):
     if not 1 <= batch_size <= 50000:
         raise ValueError('Batch size must be between 1 and 50000')
@@ -104,6 +172,9 @@ def prepare(batch_size=10000):
             # Refilling one file synchronously for each empty campaign would
             # accidentally serialize exports after the initial parallel fetch.
             prefetch(state)
+        if state.get('normalized_campaign') != campaign['id']:
+            normalize_export(export, state)
+            state['normalized_campaign'] = campaign['id']
         exhausted = True
         with export.open(encoding='utf-8-sig', newline='') as handle:
             reader = csv.DictReader(handle)
@@ -134,6 +205,7 @@ def prepare(batch_size=10000):
             state['scan_after'] = campaign['id']
             state['index'] += 1
             state['row_offset'] = 0
+            state['normalized_campaign'] = None
             state['stats']['campaigns_scanned'] += 1
             export.unlink()
     state['done'] = state['index'] >= len(state['campaigns'])
@@ -185,6 +257,8 @@ def execute(artifact_id):
     if len(frame) != manifest['rows']:
         raise ValueError('Backup row count changed')
     validate_backup(frame, state)
+    # Dry runs exercise the same final row checks as live deletion.
+    app.SmartLeadProcessor.validate_deletion_backup(frame)
     state['stats']['leads_backed_up'] += len(frame)
     state['stats']['backups_uploaded'] += 1
     processor = app.SmartLeadProcessor(app.API_KEY, LOG, 'cleanup.log')

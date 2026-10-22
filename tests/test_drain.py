@@ -75,6 +75,63 @@ class DrainTests(unittest.TestCase):
                 drain.execute(artifact_id=0)
         delete.assert_not_called()
 
+    def test_duplicate_export_rows_are_deleted_once_across_batch_boundaries(self):
+        self.rows['101'] += [dict(self.rows['101'][0]), dict(self.rows['101'][2])]
+        # IDs are canonicalized before deduplication.
+        self.rows['101'].append(dict(self.rows['101'][0], id='0001'))
+        drain.plan()
+        deleted = []
+        with patch.object(drain.app.SmartLeadProcessor, 'delete_single_lead',
+                          side_effect=lambda campaign, lead: deleted.append((campaign, lead)) or True):
+            while not drain.load()['done']:
+                batch = drain.prepare(batch_size=1)
+                if batch['backup_file']:
+                    drain.execute(artifact_id=123)
+        self.assertEqual(sorted(deleted), [('101', '1'), ('101', '3'), ('102', '4')])
+        self.assertEqual(drain.load()['stats']['duplicate_export_rows'], 3)
+        self.assertEqual(drain.load()['stats']['leads_deleted_success'], 3)
+
+    def test_late_replied_or_unknown_duplicates_veto_deletion_before_first_batch(self):
+        self.rows['101'] += [dict(self.rows['101'][0], reply_count='1'),
+                             dict(self.rows['101'][2], reply_count='unknown')]
+        # A replied row followed by zero must also be retained.
+        self.rows['101'].append(dict(self.rows['101'][1], reply_count='0'))
+        drain.plan()
+        batch = drain.prepare(batch_size=1)
+        frame = drain.app.pd.read_csv(batch['backup_file'])
+        self.assertEqual(frame['id'].tolist(), [4])
+        self.assertEqual(drain.load()['stats']['conflicting_duplicate_leads_kept'], 3)
+        self.assertEqual(drain.load()['stats']['unknown_reply_counts'], 1)
+        with patch.object(drain.app.SmartLeadProcessor, 'delete_single_lead', return_value=True) as delete:
+            drain.execute(artifact_id=123)
+        delete.assert_called_once_with('102', '4')
+
+    def test_same_lead_id_in_different_campaigns_is_not_a_duplicate(self):
+        self.rows['102'][0]['id'] = '1'
+        drain.plan()
+        batch = drain.prepare()
+        self.assertEqual(batch['rows'], 3)
+        self.assertEqual(drain.load()['stats']['duplicate_export_rows'], 0)
+
+    def test_duplicate_deletion_backup_is_still_rejected_before_any_request(self):
+        processor = drain.app.SmartLeadProcessor('test-only', drain.LOG, 'test.log')
+        frame = drain.app.pd.DataFrame([{'Campaign ID': '101', 'id': '1', 'reply_count': 0}] * 2)
+        with patch.object(processor, 'delete_single_lead') as delete:
+            with self.assertRaisesRegex(ValueError, 'duplicate campaign/lead IDs'):
+                processor.delete_leads(frame)
+        delete.assert_not_called()
+
+    def test_dry_run_also_rejects_an_unexpected_duplicate_backup(self):
+        drain.plan(dry_run=True)
+        batch = drain.prepare()
+        frame = drain.app.pd.read_csv(batch['backup_file'])
+        frame = drain.app.pd.concat([frame, frame.iloc[:1]], ignore_index=True)
+        frame.to_csv(batch['backup_file'], index=False)
+        batch.update(rows=len(frame), sha256=drain.app.file_checksum(batch['backup_file']))
+        drain.save(drain.BATCH, batch)
+        with self.assertRaisesRegex(ValueError, 'duplicate campaign/lead IDs'):
+            drain.execute(artifact_id=123)
+
     def test_changed_backup_is_rejected(self):
         drain.plan()
         batch = drain.prepare()

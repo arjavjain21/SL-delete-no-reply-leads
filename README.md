@@ -90,6 +90,13 @@ backed-up batch completes to bound memory and disk use.
 The first batch contains at most 1,000 candidates to verify the live path promptly;
 subsequent batches use the configured size.
 
+SmartLead exports can repeat the same lead. In `all` scope, each complete campaign
+export is checked before batching, and each campaign/lead pair is selected once.
+If any occurrence has replies or an unknown reply count, that lead is kept, even
+when the conflicting occurrence appears after a batch boundary. Reports include
+duplicate-row and conflicting-lead counts. The final duplicate-backup safety check
+still refuses unexpected duplicates before making deletion requests.
+
 At its work budget or artifact-count limit, the workflow dispatches a continuation
 using the last fully committed campaign ID. A partial campaign is re-exported on
 continuation, so unfinished leads are not skipped. One concurrency group prevents
