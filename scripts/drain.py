@@ -13,6 +13,8 @@ from decimal import Decimal, InvalidOperation
 import itertools
 import json
 import logging
+import math
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -72,6 +74,7 @@ def plan(resume_after=0, dry_run=False, sample=0, budget_minutes=120):
              'batch_number': 0, 'stats': {'campaigns_fetched': len(campaigns),
              'eligible_remaining_at_start': eligible_count, 'campaigns_scanned': 0,
              'leads_backed_up': 0, 'leads_deleted_success': 0, 'leads_deleted_failed': 0,
+             'leads_deferred_rate_limit': 0,
              'unknown_reply_counts': 0, 'duplicate_export_rows': 0,
              'conflicting_duplicate_leads_kept': 0, 'backups_uploaded': 0}}
     save(STATE, state)
@@ -87,9 +90,18 @@ def prefetch(state):
     with ThreadPoolExecutor(max_workers=app.ANALYSIS_WORKERS) as pool:
         futures = [pool.submit(app.export_leads_csv, app.API_KEY, campaign['id'], LOG)
                    for campaign in missing]
+        errors = []
         for future in futures:
-            if not future.result():
-                raise RuntimeError('Campaign export failed')
+            try:
+                if not future.result():
+                    raise RuntimeError('Campaign export failed')
+            except Exception as exc:
+                errors.append(exc)
+        fatal = next((error for error in errors if not isinstance(error, app.SmartLeadRateLimitError)), None)
+        if fatal:
+            raise fatal
+        if errors:
+            raise app.SmartLeadRateLimitError(max(error.retry_after for error in errors))
 
 
 def normalize_export(export, state):
@@ -269,6 +281,7 @@ def execute(artifact_id):
     finally:
         state['stats']['leads_deleted_success'] += processor.execution_stats['leads_deleted_success']
         state['stats']['leads_deleted_failed'] += processor.execution_stats['leads_deleted_failed']
+        state['stats']['leads_deferred_rate_limit'] += processor.execution_stats['leads_deferred_rate_limit']
         save(STATE, state)
     if finished:
         state['confirmed_after'] = state['scan_after']
@@ -284,10 +297,19 @@ def execute(artifact_id):
 
 
 def report(status):
-    state = load()
+    state = load() if STATE.is_file() else {
+        'stats': {}, 'confirmed_after': int(os.environ.get('RESUME_AFTER_CAMPAIGN') or '0'),
+        'dry_run': os.environ.get('DRY_RUN') == 'true',
+        'sample': int(os.environ.get('SAMPLE_CAMPAIGNS') or '0')}
     stats = state['stats']
     summary = {'status': status, 'stats_this_run': stats, 'resume_after': state['confirmed_after'],
                'dry_run': state['dry_run'], 'sample_campaigns': state['sample']}
+    continuation = load(Path('continuation.json')) if Path('continuation.json').is_file() else None
+    if continuation:
+        summary['continuation'] = continuation
+    resume_at = (datetime.fromtimestamp(continuation['not_before'], timezone.utc)
+                 .astimezone(app.pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %I:%M:%S %p IST')
+                 if continuation else '')
     save(Path('summary.json'), summary)
     body = (f"SmartLead all-eligible cleanup: {status}\n\n"
             f"Run: {app.GITHUB_SERVER_URL}/{app.GITHUB_REPOSITORY}/actions/runs/{app.GITHUB_RUN_ID}\n"
@@ -299,6 +321,12 @@ def report(status):
             + ('Dry run: no leads were deleted.\n' if state['dry_run'] else '')
             + (f"Sample validation: up to {state['sample']} eligible campaigns.\n" if state['sample'] else '')
             + ('A continuation run is queued to process the remaining campaigns.\n' if status == 'continuing' else '')
+            + (f"SmartLead returned HTTP 429. A slower continuation is queued "
+               f"no earlier than {resume_at}, "
+               f"capped at {continuation['request_limit']} requests/minute. "
+               f"Automatic cooldown retry {continuation['rate_limit_retries']}/3. "
+               'Unfinished campaigns will be re-exported; remaining leads are not skipped.\n'
+               if status == 'rate-limited' and continuation else '')
             + 'Each batch backup was uploaded before deletion. Download backups from Actions artifacts; retained 30 days.\n')
     if not app.send_email(f'SmartLead cleanup: {status}', body, ['cleanup.log'], LOG):
         raise RuntimeError('Resend could not send the cleanup report')
@@ -314,7 +342,7 @@ def main():
     parser.add_argument('--budget-minutes', type=int, default=120)
     parser.add_argument('--batch-size', type=int, default=10000)
     parser.add_argument('--artifact-id', type=int)
-    parser.add_argument('--status', choices=['complete', 'continuing', 'failed', 'dry-run'], default='complete')
+    parser.add_argument('--status', choices=['complete', 'continuing', 'rate-limited', 'failed', 'dry-run'], default='complete')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
                         handlers=[logging.FileHandler('cleanup.log'), logging.StreamHandler()])
@@ -328,6 +356,10 @@ def main():
             execute(args.artifact_id)
         else:
             report(args.status)
+    except app.SmartLeadRateLimitError as exc:
+        save(Path('rate-limit.json'), {'retry_after_seconds': math.ceil(exc.retry_after)})
+        LOG.warning('%s; leaving the confirmed cursor unchanged for a delayed retry', exc)
+        raise SystemExit(75)
     except Exception as exc:
         LOG.error('%s', exc)
         message = str(exc).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')

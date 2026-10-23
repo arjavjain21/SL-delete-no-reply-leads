@@ -2,6 +2,7 @@ import csv
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -167,6 +168,80 @@ class DrainTests(unittest.TestCase):
             result = drain.execute(artifact_id=1)
         self.assertFalse(result['finished'])
         self.assertEqual(drain.load()['confirmed_after'], 0)
+
+    def test_throttle_checkpoints_all_inflight_successes_without_committing_cursor(self):
+        drain.plan()
+        batch = drain.prepare()
+
+        def delete(campaign, lead):
+            if lead == '1':
+                raise drain.app.SmartLeadRateLimitError(120)
+            return True
+
+        with patch.object(drain.app, 'DELETE_WORKERS', 2), \
+             patch.object(drain.app.SmartLeadProcessor, 'delete_single_lead', side_effect=delete) as request:
+            with self.assertRaises(drain.app.SmartLeadRateLimitError):
+                drain.execute(artifact_id=123)
+        self.assertEqual(request.call_count, 2)  # Third row was never queued.
+        state = drain.load()
+        self.assertEqual(state['stats']['leads_deleted_success'], 1)
+        self.assertEqual(state['stats']['leads_deferred_rate_limit'], 1)
+        self.assertEqual(state['stats']['leads_deleted_failed'], 0)
+        self.assertEqual(state['confirmed_after'], 0)
+        self.assertTrue(Path(batch['backup_file']).is_file())
+
+    def test_auth_failure_wins_over_a_concurrent_throttle(self):
+        drain.plan()
+        drain.prepare()
+
+        def delete(campaign, lead):
+            if lead == '1':
+                raise drain.app.SmartLeadRateLimitError(120)
+            raise RuntimeError('SmartLead authentication/authorization failed (HTTP 401)')
+
+        with patch.object(drain.app, 'DELETE_WORKERS', 2), \
+             patch.object(drain.app.SmartLeadProcessor, 'delete_single_lead', side_effect=delete):
+            with self.assertRaisesRegex(RuntimeError, 'authentication') as captured:
+                drain.execute(artifact_id=123)
+        self.assertNotIsInstance(captured.exception, drain.app.SmartLeadRateLimitError)
+
+    def test_export_failure_is_not_hidden_by_concurrent_throttle(self):
+        state = drain.plan()
+        with patch.object(drain.app, 'export_leads_csv', side_effect=[
+                drain.app.SmartLeadRateLimitError(120), RuntimeError('Export validation failed')]):
+            with self.assertRaisesRegex(RuntimeError, 'Export validation'):
+                drain.prefetch(state)
+
+    def test_rate_limit_report_explains_delay_and_lower_cap(self):
+        drain.plan()
+        drain.save(Path('continuation.json'), {'not_before': 1800000000,
+                   'request_limit': 600, 'rate_limit_retries': 1})
+        summary = drain.report('rate-limited')
+        body = drain.app.send_email.call_args.args[1]
+        self.assertIn('HTTP 429', body)
+        self.assertIn('600 requests/minute', body)
+        self.assertIn('Automatic cooldown retry 1/3', body)
+        self.assertEqual(summary['continuation']['not_before'], 1800000000)
+
+    def test_throttled_plan_can_report_without_a_campaign_list(self):
+        with patch.dict(os.environ, {'RESUME_AFTER_CAMPAIGN': '101', 'DRY_RUN': 'false',
+                                    'SAMPLE_CAMPAIGNS': '0'}):
+            summary = drain.report('failed')
+        self.assertEqual(summary['resume_after'], 101)
+        self.assertEqual(summary['stats_this_run'], {})
+
+    def test_cli_throttle_returns_temporary_exit_code_and_safe_metadata(self):
+        with patch.object(sys, 'argv', ['drain.py', 'plan']), \
+             patch.object(drain.app, 'validate_environment'), \
+             patch.object(drain, 'plan', side_effect=drain.app.SmartLeadRateLimitError(90)), \
+             patch.object(drain.logging, 'basicConfig'), \
+             patch.object(drain.logging, 'FileHandler'), \
+             self.assertLogs(drain.LOG, level='WARNING'):
+            with self.assertRaises(SystemExit) as captured:
+                drain.main()
+        self.assertEqual(captured.exception.code, 75)
+        self.assertEqual(drain.load(Path('rate-limit.json')), {'retry_after_seconds': 90})
+        self.assertFalse(drain.STATE.exists())
 
     def test_policy_metadata_rejects_recent_or_excluded_campaign(self):
         state = drain.plan()

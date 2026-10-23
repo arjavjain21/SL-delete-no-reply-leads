@@ -112,6 +112,13 @@ def setup_logging():
     return logger, log_filename
 
 # === HTTP REQUEST UTILITY ===
+class SmartLeadRateLimitError(RuntimeError):
+    """A persistent HTTP 429 can be resumed after a server-respecting cooldown."""
+    def __init__(self, retry_after):
+        self.retry_after = max(1, math.ceil(retry_after))
+        super().__init__('SmartLead rate limit requires delayed recovery (HTTP 429)')
+
+
 class RateLimiter:
     """Space every attempt across workers; share server-requested cooldowns."""
     def __init__(self, requests_per_minute):
@@ -183,7 +190,12 @@ def send_request(method, url, params=None, data=None, logger=None):
             if logger:
                 logger.warning('SmartLead %s attempt %s: %s', method, attempt, type(exc).__name__)
         # Also protect other workers after this request exhausts its retries.
-        smartlead_limiter.defer(retry_delay(response, attempt))
+        delay = retry_delay(response, attempt)
+        smartlead_limiter.defer(delay)
+        if response is not None and response.status_code == 429 and (attempt == MAX_RETRIES or delay >= 300):
+            # Hand long server cooldowns to the resumable controller instead of
+            # spending the runner's work budget sleeping through repeated waits.
+            raise SmartLeadRateLimitError(delay)
     return None
 
 
@@ -311,6 +323,7 @@ class SmartLeadProcessor:
             'leads_backed_up': 0,
             'leads_deleted_success': 0,
             'leads_deleted_failed': 0,
+            'leads_deferred_rate_limit': 0,
             'execution_time': 0
         }
         self.output_files = []
@@ -521,14 +534,30 @@ class SmartLeadProcessor:
                 if deadline is not None and time.time() >= deadline:
                     return False
                 batch = pairs[offset:offset + DELETE_WORKERS]
-                results = executor.map(lambda pair: self.delete_single_lead(*pair), batch)
-                for success in results:
-                    success_count += int(success)
-                    failed_count += int(not success)
+                futures = [executor.submit(self.delete_single_lead, *pair) for pair in batch]
+                errors = []
+                for future in futures:
+                    try:
+                        success = future.result()
+                    except Exception as exc:
+                        # Collect every already-running result before propagating
+                        # an error so concurrent successes are never lost.
+                        errors.append(exc)
+                        if isinstance(exc, SmartLeadRateLimitError):
+                            self.execution_stats['leads_deferred_rate_limit'] += 1
+                    else:
+                        success_count += int(success)
+                        failed_count += int(not success)
                     self.execution_stats['leads_deleted_success'] = success_count
                     self.execution_stats['leads_deleted_failed'] = failed_count
+                # A real failure must not be hidden by a concurrent throttle.
+                fatal = next((error for error in errors if not isinstance(error, SmartLeadRateLimitError)), None)
+                if fatal:
+                    raise fatal
                 if stop_on_failure and failed_count:
                     raise RuntimeError('Lead deletion failed; stopping this batch for review')
+                if errors:
+                    raise SmartLeadRateLimitError(max(error.retry_after for error in errors))
                 processed = success_count + failed_count
                 if processed // 100 > offset // 100 or processed == len(pairs):
                     self.logger.info('Progress: %s/%s processed', processed, len(pairs))

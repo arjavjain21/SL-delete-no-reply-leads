@@ -29,6 +29,18 @@ on:
         description: Continuation cursor; leave 0 for a new cleanup
         type: string
         default: '0'
+      resume_not_before:
+        description: Automatic cooldown continuation timestamp; leave 0 for a new cleanup
+        type: string
+        default: '0'
+      rate_limit_retries:
+        description: Automatic consecutive cooldown retry count; leave 0 for a new cleanup
+        type: string
+        default: '0'
+      resume_request_limit:
+        description: Automatic reduced request cap; 0 uses the configured account cap
+        type: string
+        default: '0'
   schedule:
     - cron: "0 7 * * *" # Daily at 07:00 UTC / 12:30 PM IST
 
@@ -60,6 +72,9 @@ jobs:
       SAMPLE_CAMPAIGNS: ${{ inputs.sample_campaigns || '0' }}
       CLEANUP_SCOPE: ${{ inputs.cleanup_scope || 'all' }}
       RESUME_AFTER_CAMPAIGN: ${{ inputs.resume_after_campaign || '0' }}
+      RESUME_NOT_BEFORE: ${{ inputs.resume_not_before || '0' }}
+      RATE_LIMIT_RETRIES: ${{ inputs.rate_limit_retries || '0' }}
+      RESUME_REQUEST_LIMIT: ${{ inputs.resume_request_limit || '0' }}
       DELETE_BATCH_SIZE: ${{ vars.DELETE_BATCH_SIZE || '10000' }}
       CLEANUP_BUDGET_MINUTES: ${{ vars.CLEANUP_BUDGET_MINUTES || '120' }}
       PYTHONUNBUFFERED: '1'

@@ -49,6 +49,22 @@ SmartLead account share its 6,000 requests/minute allowance; lower this setting
 when necessary. Actual throughput also depends on response time and server
 cooldowns. Retries honor `Retry-After` and use exponential backoff. Permanent
 errors are not repeatedly retried, and authentication errors abort the run.
+If SmartLead still returns HTTP 429 after those attempts, or requests a cooldown
+of at least five minutes, the default `all` cleanup keeps its confirmed cursor
+and queues a slower continuation after a
+5-, 10-, or 20-minute cooldown. It never shortens `Retry-After`. The first
+recovery run uses at most 600 requests/minute and four workers; further throttling
+halves that cap. Successful work-budget continuations gradually restore the
+configured cap. Throttled, unfinished campaigns are re-exported instead of
+skipped, with a new durable backup before deletion. Concurrent successful
+deletions are counted even when another worker is throttled.
+
+Three consecutive cooldown continuations without a completed live batch stop
+the chain and report failure; a server cooldown beyond 30 minutes also stops it
+instead of retrying early. A `rate-limited` email means a delayed continuation
+was queued, while `failed` means cleanup stopped. The counters distinguish
+deferred HTTP 429 requests from permanent deletion failures. Other applications
+can consume the account allowance even while this workflow stays below its cap.
 
 ## Start and verify
 
@@ -103,7 +119,9 @@ continuation, so unfinished leads are not skipped. One concurrency group prevent
 runs sharing this account from overlapping. Errors stop cleanup and send a failure
 report; a later fresh run can safely revisit remaining server-side leads. The
 workflow needs `actions: write` only to queue its own continuation. Leave the
-advanced `resume_after_campaign` input at `0` for a fresh cleanup. Each run emails
+advanced `resume_after_campaign` input at `0` for a fresh cleanup. The additional
+`resume_not_before`, `rate_limit_retries`, and `resume_request_limit` inputs carry
+automatic recovery state; leave them at `0` for a fresh cleanup. Each run emails
 its own deletion counts and whether more work was queued. Large backlogs can
 require multiple runs and several hours; 100,000 DELETE requests alone take at
 least about 19 minutes at 5,400 requests/minute, before latency and retry costs.

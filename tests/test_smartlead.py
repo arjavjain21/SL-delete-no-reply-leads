@@ -135,6 +135,23 @@ class SmartLeadRequestTests(unittest.TestCase):
         self.assertEqual(app.send_request('GET', app.BASE_URL).status_code, 400)
         self.assertEqual(self.session.request.call_count, 1)
 
+    def test_exhausted_429_is_distinct_and_preserves_server_cooldown(self):
+        self.session.request.return_value = response(429, headers={'Retry-After': '120'})
+        with self.assertRaises(app.SmartLeadRateLimitError) as captured:
+            app.send_request('DELETE', app.BASE_URL)
+        self.assertEqual(captured.exception.retry_after, 120)
+        self.assertEqual(self.session.request.call_count, app.MAX_RETRIES)
+        self.assertEqual(app.smartlead_limiter.wait.call_count, app.MAX_RETRIES)
+        app.smartlead_limiter.defer.assert_called_with(120)
+
+    def test_long_server_cooldown_yields_without_consuming_the_runner_budget(self):
+        self.session.request.return_value = response(429, headers={'Retry-After': '900'})
+        with self.assertRaises(app.SmartLeadRateLimitError) as captured:
+            app.send_request('DELETE', app.BASE_URL)
+        self.assertEqual(captured.exception.retry_after, 900)
+        self.assertEqual(self.session.request.call_count, 1)
+        app.smartlead_limiter.defer.assert_called_once_with(900)
+
     def test_auth_error_aborts(self):
         self.session.request.return_value = response(401)
         with self.assertRaisesRegex(RuntimeError, 'authentication'):
